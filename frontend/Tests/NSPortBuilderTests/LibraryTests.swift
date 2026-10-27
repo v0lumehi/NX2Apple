@@ -361,6 +361,9 @@ final class LibraryTests: XCTestCase {
         model.startBuild()
         wait(for: [completed], timeout: 10)
         withExtendedLifetime(token) {}
+        // The library can list the app before the model has taken in the script's exit (a slower Mac, CI): wait for both
+        let settled = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in model.done && !model.running }, object: nil)
+        wait(for: [settled], timeout: 10)
         XCTAssertTrue(model.done)
         XCTAssertFalse(model.running)
         XCTAssertEqual(model.stages.map(\.name), ["Mac app"])   // from the JSON events, which the log shows as text
