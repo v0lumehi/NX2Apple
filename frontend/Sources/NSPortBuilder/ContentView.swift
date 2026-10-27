@@ -1483,8 +1483,10 @@ struct BuilderView: View {
     var controlChanges = 0
     @State private var extrasOpen = false
     @State private var logOpen = false
+    @EnvironmentObject private var padFocus: PadFocus
 
     var body: some View {
+        ScrollViewReader { proxy in
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 34) {
                 if settings { settingsPage } else { buildPage }
@@ -1492,6 +1494,10 @@ struct BuilderView: View {
             .padding(.horizontal, 40).padding(.top, 40).padding(.bottom, 48)
             .frame(maxWidth: 900)
             .frame(maxWidth: .infinity)
+        }
+        .onChange(of: padFocus.focused) { id in   // a controller's focus on this page scrolls into view
+            if let id, id.hasPrefix("set.") { withAnimation(.easeInOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) } }
+        }
         }
         .buttonStyle(LauncherSecondaryButtonStyle())
     }
@@ -1832,13 +1838,16 @@ struct BuilderView: View {
                 if library.scanning { ProgressView().controlSize(.small) }
                 if !library.folder.isEmpty {
                     Button(m.t("library.rescan")) { library.discover() }.disabled(library.scanning)
+                        .padTarget("set.rescan", scope: "main") { if !library.scanning { library.discover() } }
                 }
                 Button(m.t("library.chooseFolder"), action: onChooseLibraryFolder)
+                    .padTarget("set.folder", scope: "main") { onChooseLibraryFolder() }
             }
         }
         group(m.t("section.controls"), footnote: m.t("controls.settingsHint")) {
             row(m.t("controls.row"), detail: controlChanges == 0 ? m.t("controls.defaultLayout") : String(format: m.t("controls.changes"), controlChanges)) {
                 Button(m.t("controls.customize"), action: onOpenControls)
+                    .padTarget("set.controls", scope: "main") { onOpenControls() }
             }
         }
         tools
@@ -1857,16 +1866,28 @@ struct BuilderView: View {
                     m.lang = Lang.initial()
                 }
                 .frame(width: Self.settingsButtonWidth)
+                .padTarget("set.language", scope: "main", activate: { cycleLanguage(1) }, adjust: { cycleLanguage($0) })
             }
             divider
             row("NX2Apple", detail: String(format: m.t("app.version"), BuildModel.appVersion)) {
                 if let u = m.appUpdate {
                     Button(String(format: m.t("app.updateBtn"), u.tag)) { m.performAppUpdate() }.disabled(m.appBusy)
+                        .padTarget("set.appUpdate", scope: "main") { if !m.appBusy { m.performAppUpdate() } }
                 } else {
                     Button(m.t("repo.check")) { m.checkAppUpdate() }.disabled(m.appBusy)
+                        .padTarget("set.appCheck", scope: "main") { if !m.appBusy { m.checkAppUpdate() } }
                 }
             }
         }
+    }
+
+    /// The interface language one step on (a controller's left / right on the language list).
+    private func cycleLanguage(_ by: Int) {
+        let values = ["", "zh", "en"]
+        let at = values.firstIndex(of: Lang.saved.map { $0.rawValue } ?? "") ?? 0
+        let v = values[(at + by + values.count) % values.count]
+        Lang.saved = v.isEmpty ? nil : Lang(rawValue: v)
+        m.lang = Lang.initial()
     }
 
     private var tools: some View {
@@ -1880,10 +1901,13 @@ struct BuilderView: View {
                     if m.repoIsGit {
                         if let n = m.repoBehind, n > 0 {
                             Button(m.t("repo.pull")) { m.pullRepo() }.disabled(m.repoBusy || m.running)
+                                .padTarget("set.repoPull", scope: "main") { if !(m.repoBusy || m.running) { m.pullRepo() } }
                         }
                         Button(m.t("repo.check")) { m.checkRepoUpdates() }.disabled(m.repoBusy || m.running)
+                            .padTarget("set.repoCheck", scope: "main") { if !(m.repoBusy || m.running) { m.checkRepoUpdates() } }
                     } else {
                         Button(m.t("repo.adopt")) { m.adoptRepoAsGit() }.disabled(m.repoBusy || m.running)
+                            .padTarget("set.repoAdopt", scope: "main") { if !(m.repoBusy || m.running) { m.adoptRepoAsGit() } }
                     }
                 } else {
                     Button(m.t("repo.choose")) { pickRepo() }
@@ -1913,6 +1937,7 @@ struct BuilderView: View {
                     open: m.depsOpen) {
                     if !m.depsChecked { ProgressView().controlSize(.small) }
                     Button(m.t("dep.recheck")) { m.checkDeps() }
+                        .padTarget("set.deps", scope: "main") { m.checkDeps() }
                 }
                 .contentShape(Rectangle())
             }

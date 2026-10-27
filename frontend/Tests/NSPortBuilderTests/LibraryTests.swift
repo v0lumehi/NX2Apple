@@ -539,7 +539,7 @@ final class LibraryTests: XCTestCase {
             try FileManager.default.createDirectory(at: dm, withIntermediateDirectories: true)
             try FileManager.default.copyItem(at: URL(fileURLWithPath: json), to: dm.appendingPathComponent("launcher.json"))
             if let fps = LaunchSetting.read(app: first.appPath)?.first(where: { $0.env == "DM_FPS_TARGET" }) { library.setLaunchOption(fps, "60", for: first.id) }
-            let host = NSHostingView(rootView: LaunchOptionsView(m: model, library: library, gameID: first.id))
+            let host = NSHostingView(rootView: LaunchOptionsView(m: model, library: library, gameID: first.id).environmentObject(PadFocus()))
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
             window.contentView = host
             window.orderFront(nil)
@@ -547,6 +547,19 @@ final class LibraryTests: XCTestCase {
             let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
             host.cacheDisplay(in: host.bounds, to: rep)
             try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: output.appendingPathComponent("launch-options.png"))
+            window.orderOut(nil)
+            // The same sheet with a controller's focus on the console mode row
+            let focus = PadFocus()
+            let focused = NSHostingView(rootView: LaunchOptionsView(m: model, library: library, gameID: first.id).environmentObject(focus))
+            window.contentView = focused
+            window.orderFront(nil)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+            focus.scope = "launch"
+            focus.show(default: "opt.DM_OPMODE")
+            RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+            let focusRep = try XCTUnwrap(focused.bitmapImageRepForCachingDisplay(in: focused.bounds))
+            focused.cacheDisplay(in: focused.bounds, to: focusRep)
+            try XCTUnwrap(focusRep.representation(using: .png, properties: [:])).write(to: output.appendingPathComponent("launch-options-focus.png"))
             window.orderOut(nil)
         }
         do {   // the Controls sheet with a few changes, kept in a suite of its own
@@ -557,7 +570,7 @@ final class LibraryTests: XCTestCase {
             let layout = ControlLayout(defaults: defaults)
             if let up = ControlLayout.functions.first(where: { $0.id == "RUp" }) { layout.assign(up, key: 34) }
             layout.setSends("A", "B"); layout.setSends("B", "A")
-            let host = NSHostingView(rootView: ControlsView(m: model, layout: layout))
+            let host = NSHostingView(rootView: ControlsView(m: model, layout: layout).environmentObject(PadFocus()))
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
             window.contentView = host
             window.orderFront(nil)

@@ -108,6 +108,7 @@ struct ControlsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var listening: String?
     @State private var monitor: Any?
+    @EnvironmentObject private var focus: PadFocus
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -116,6 +117,7 @@ struct ControlsView: View {
                 Text(m.t("controls.note")).font(.manrope(14)).foregroundStyle(.secondary)
             }
             .padding(.horizontal, 30).padding(.top, 28).padding(.bottom, 20)
+            ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     section(m.t("controls.sticks"), ControlLayout.functions.filter(\.isDirection)) { keyRow($0) }
@@ -124,6 +126,8 @@ struct ControlsView: View {
                 }
                 .padding(.horizontal, 30).padding(.bottom, 24)
             }
+            .onChange(of: focus.focused) { id in if let id { withAnimation(.easeInOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) } } }
+            }
             Divider().opacity(0.3)
             HStack(spacing: 14) {
                 Text(m.t("controls.applied")).font(.manrope(12)).foregroundStyle(.secondary).lineLimit(2)
@@ -131,6 +135,7 @@ struct ControlsView: View {
                 if !layout.isDefault {
                     Button(m.t("controls.reset")) { stopListening(); layout.resetKeyboard(); layout.resetController() }
                         .buttonStyle(LauncherSecondaryButtonStyle())
+                        .padTarget("controls.reset", scope: "controls") { stopListening(); layout.resetKeyboard(); layout.resetController() }
                 }
                 Button { stopListening(); dismiss() } label: {
                     Text(m.t("launch.done")).font(.manrope(13.5, .bold)).foregroundStyle(.black)
@@ -138,9 +143,11 @@ struct ControlsView: View {
                         .background(LauncherPalette.cream, in: Capsule())
                 }
                 .buttonStyle(.plain).keyboardShortcut(listening == nil ? .defaultAction : nil)
+                .padTarget("controls.done", scope: "controls", radius: 20) { stopListening(); dismiss() }
             }
             .padding(.horizontal, 30).padding(.vertical, 16)
         }
+        .padScope("controls", focus)
         .frame(width: 600, height: 700)
         .background(LauncherPalette.background)
         .font(.manrope(13))
@@ -166,7 +173,8 @@ struct ControlsView: View {
         }
     }
 
-    private func line<Trailing: View>(_ title: String, @ViewBuilder trailing: () -> Trailing) -> some View {
+    private func line<Trailing: View>(_ title: String, target: String, activate: (() -> Void)? = nil, adjust: ((Int) -> Void)? = nil,
+                                      @ViewBuilder trailing: () -> Trailing) -> some View {
         HStack(spacing: 16) {
             Text(title).font(.manrope(14, .medium))
             Spacer(minLength: 12)
@@ -174,12 +182,13 @@ struct ControlsView: View {
         }
         .padding(.horizontal, 18).padding(.vertical, 9)
         .frame(minHeight: 46)
+        .padTarget(target, scope: "controls", radius: 10, activate: activate, adjust: adjust)
     }
 
     private func keyRow(_ f: ControlLayout.Function) -> some View {
         let on = listening == f.id
         let key = layout.key(f)
-        return line(m.t("controls.fn." + f.id)) {
+        return line(m.t("controls.fn." + f.id), target: "key." + f.id, activate: { on ? stopListening() : listen(f) }) {
             HStack(spacing: 6) {
                 if key != nil && !on {
                     Button { layout.assign(f, key: nil) } label: {
@@ -204,7 +213,12 @@ struct ControlsView: View {
     }
 
     private func padRow(_ button: String) -> some View {
-        line(m.t("controls.fn." + button)) {
+        let choices = ControlLayout.buttons + ["none"]
+        return line(m.t("controls.fn." + button), target: "pad." + button,
+                    adjust: { by in
+                        let at = choices.firstIndex(of: layout.sends(button)) ?? 0
+                        layout.setSends(button, choices[(at + by + choices.count) % choices.count])
+                    }) {
             LauncherMenuPicker(options: ControlLayout.buttons.map { (value: $0, label: m.t("controls.fn." + $0)) } + [(value: "none", label: m.t("controls.none"))],
                                selection: layout.sends(button), fill: true) { layout.setSends(button, $0) }
                 .frame(width: 168)   // the keyboard rows' width (× and key field), and "Right stick press" fits

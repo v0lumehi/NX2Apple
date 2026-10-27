@@ -37,7 +37,7 @@ struct ContentView: View {
     @State private var controlsOpen = false
     @StateObject private var controls = ControlLayout()
     @StateObject private var gamepad = LauncherGamepad()
-    @State private var padScroll: UUID?   // the card a controller moved to, scrolled into view
+    @StateObject private var padFocus = PadFocus()
     @StateObject private var row = RowScroller()
     private var performStartupChecks: Bool
     @Environment(\.scenePhase) private var scenePhase
@@ -70,6 +70,8 @@ struct ContentView: View {
             }
             if m.running || page == .library { activityBar }
         }
+        .padScope("main", padFocus)
+        .environmentObject(padFocus)
         .background(LauncherPalette.background)
         .background(LauncherWindowChrome())
         .ignoresSafeArea(.container, edges: .top)
@@ -122,9 +124,15 @@ struct ContentView: View {
             }
         } message: { Text(m.t("library.removeNote")) }
         .sheet(isPresented: Binding(get: { optionsFor != nil }, set: { if !$0 { optionsFor = nil } })) {
-            if let id = optionsFor { LaunchOptionsView(m: m, library: library, gameID: id) }
+            if let id = optionsFor { LaunchOptionsView(m: m, library: library, gameID: id).environmentObject(padFocus) }
         }
-        .sheet(isPresented: $controlsOpen) { ControlsView(m: m, layout: controls) }
+        .sheet(isPresented: $controlsOpen) { ControlsView(m: m, layout: controls).environmentObject(padFocus) }
+        .onChange(of: optionsFor) { id in padFocus.scope = id != nil ? "launch" : (controlsOpen ? "controls" : "main") }
+        .onChange(of: controlsOpen) { open in padFocus.scope = open ? "controls" : (optionsFor != nil ? "launch" : "main") }
+        .onChange(of: page) { _ in padFocus.focused = nil }
+        .onChange(of: padFocus.focused) { id in   // a controller moving onto a game's card selects it, as a click does
+            if let id, id.hasPrefix("card."), let uuid = UUID(uuidString: String(id.dropFirst(5))) { library.selectedID = uuid }
+        }
     }
 
     private var topBar: some View {
@@ -148,6 +156,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityAddTraits(page == destination ? .isSelected : [])
+                .padTarget("tab." + destination.rawValue, scope: "main") { page = destination }
             }
             Spacer(minLength: 8)
             searchField
@@ -158,8 +167,9 @@ struct ContentView: View {
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.white.opacity(0.1)))
                     .contentShape(RoundedRectangle(cornerRadius: 8))
             }
-            .padding(.leading, 12)
             .buttonStyle(.plain).disabled(m.running)
+            .padTarget("top.build", scope: "main", radius: 8) { if !m.running { newBuild() } }
+            .padding(.leading, 12)
         }
         .padding(.leading, 90).padding(.trailing, 24)
         .frame(height: 64)
@@ -279,6 +289,7 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain).disabled(launching || (m.running && !game.isReady))
                     .keyboardShortcut(.return, modifiers: [])
+                    .padTarget("hero.play", scope: "main", radius: 30) { if !launching { primaryAction(game) } }
                     if game.isReady {
                         Button { optionsFor = game.id } label: {
                             Image(systemName: "slider.horizontal.3").font(.system(size: 17))
@@ -287,6 +298,7 @@ struct ContentView: View {
                                 .overlay(Circle().strokeBorder(Color.white.opacity(0.14)))
                         }
                         .buttonStyle(.plain).help(m.t("launch.title")).accessibilityLabel(m.t("launch.title"))
+                        .padTarget("hero.options", scope: "main", radius: 24) { optionsFor = game.id }
                     }
                     Menu {
                         Button(m.t("library.buildAgain")) { configureBuild(game) }.disabled(m.running || game.inputs["base", default: []].isEmpty)
@@ -356,16 +368,15 @@ struct ContentView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .accessibilityAddTraits(game.id == library.selectedID ? .isSelected : [])
-                                .id(game.id)
+                                .padTarget("card." + game.id.uuidString, scope: "main", radius: 7) { if !launching { primaryAction(game) } }
                             }
                         }
                         .padding(.bottom, 5)
                         .background(EnclosingScrollView(row: row))
                     }
-                    .onChange(of: padScroll) { id in
-                        guard let id else { return }
+                    .onChange(of: padFocus.focused) { id in   // the focused card scrolls into the row's view
+                        guard let id, id.hasPrefix("card.") else { return }
                         withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .center) }
-                        padScroll = nil
                     }
                 }
                     .overlay(alignment: .topLeading) {
@@ -488,28 +499,34 @@ struct ContentView: View {
         page = .builds
     }
 
-    /// A controller's button in the library (LauncherGamepad): left / right move through the collection, A plays, X opens
-    /// the launch options, B closes a sheet or goes back to the library.
+    /// A controller's button (LauncherGamepad): the first press shows the focus (on the selected game's card in the library),
+    /// then the D-pad moves it (PadFocus), A activates, B closes a sheet or goes back to the library, X opens the selected
+    /// game's launch options, L and R switch the pages.
     private func padAction(_ action: LauncherGamepad.Action) {
-        let sheetOpen = optionsFor != nil || controlsOpen || removing != nil
-        switch action {
-        case .b:
+        let sheetOpen = optionsFor != nil || controlsOpen
+        if action == .b {
             if optionsFor != nil { optionsFor = nil } else if controlsOpen { controlsOpen = false }
             else if searching { searching = false; search = "" } else if page != .library { page = .library }
-        case _ where sheetOpen || page != .library:
             return
-        case .left, .right:
-            let games = filteredGames
-            guard !games.isEmpty else { return }
-            let at = games.firstIndex { $0.id == library.selectedID } ?? 0
-            let next = games[min(max(at + (action == .left ? -1 : 1), 0), games.count - 1)]
-            library.selectedID = next.id
-            padScroll = next.id
-        case .a:
-            if let game = library.selected, !launching { primaryAction(game) }
+        }
+        if removing != nil { return }   // the remove dialog is AppKit's; it takes the mouse or the keyboard
+        if !padFocus.visible {
+            padFocus.show(default: !sheetOpen && page == .library ? library.selectedID.map { "card." + $0.uuidString } : nil)
+            if [.up, .down, .left, .right].contains(action) { return }   // the first press only shows where the focus is
+        }
+        switch action {
+        case .up: padFocus.move(dx: 0, dy: -1)
+        case .down: padFocus.move(dx: 0, dy: 1)
+        case .left: padFocus.horizontal(-1)
+        case .right: padFocus.horizontal(1)
+        case .a: padFocus.activate()
         case .x:
-            if let game = library.selected, game.isReady { optionsFor = game.id }
-        case .y:
+            if !sheetOpen, let game = library.selected, game.isReady { optionsFor = game.id }
+        case .l, .r:
+            guard !sheetOpen, let at = LauncherPage.allCases.firstIndex(of: page) else { return }
+            let pages = LauncherPage.allCases
+            page = pages[(at + (action == .l ? pages.count - 1 : 1)) % pages.count]
+        case .b, .y:
             return
         }
     }
