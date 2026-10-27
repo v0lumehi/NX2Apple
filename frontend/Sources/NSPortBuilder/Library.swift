@@ -14,6 +14,7 @@ struct LibraryGame: Codable, Identifiable, Equatable {
     var outputDirectory = ""
     var artworkPath = ""
     var launchOptions: [String: String] = [:]
+    var mods: [String] = []   // the mods (folder names in the game's mods folder) switched on
     var iosAppPath = ""
     var installedDevice = ""
 
@@ -42,6 +43,7 @@ extension LibraryGame {
         outputDirectory = try c.decodeIfPresent(String.self, forKey: .outputDirectory) ?? ""
         artworkPath = try c.decodeIfPresent(String.self, forKey: .artworkPath) ?? ""
         launchOptions = try c.decodeIfPresent([String: String].self, forKey: .launchOptions) ?? [:]
+        mods = try c.decodeIfPresent([String].self, forKey: .mods) ?? []
         iosAppPath = try c.decodeIfPresent(String.self, forKey: .iosAppPath) ?? ""
         installedDevice = try c.decodeIfPresent(String.self, forKey: .installedDevice) ?? ""
     }
@@ -55,8 +57,17 @@ struct LaunchSetting: Decodable, Identifiable {
     let options: [[String]]?   // choice: [value, label]
     let min, max, step: Double?   // range
     let on, off: String?   // toggle: the values the variable takes
+    /// "basic" or "advanced" (settings.tsv's level column); without it, the basic rows are `basicByDefault`.
+    var level: String? = nil
+    /// The 3D views' base size the setting scales, docked and handheld ([width, height]); the render scale's row shows pixels with it.
+    var base: [String: [Int]]? = nil
+    /// The value that leaves the variable unset (DM_FULLSCREEN is on when it is set at all).
+    var unsetValue: String? = nil
     var id: String { env }
     var sectionTitle: String { section ?? "Game" }
+    /// The rows the sheet shows first, as seedds/nxnative#374 groups them; the rest are under Advanced settings.
+    static let basicByDefault: Set = ["DM_RENDER_SCALE", "DM_FULLSCREEN", "DM_FPS_TARGET", "DM_OPMODE", "DM_LANG", "DM_RUMBLE"]
+    var isBasic: Bool { level.map { $0 == "basic" } ?? Self.basicByDefault.contains(env) }
     var onValue: String { on ?? "1" }
     var offValue: String { off ?? "0" }
     func isDefault(_ v: String) -> Bool {   // a range compares as numbers (a slider writes 1.00 for 1.0)
@@ -72,7 +83,7 @@ struct LaunchSetting: Decodable, Identifiable {
         default: return true
         }
     }
-    enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", section, options, min, max, step, on, off }
+    enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", section, options, min, max, step, on, off, level, base }
 
     private struct File: Decodable { let settings: [LaunchSetting] }
     /// The settings a Mac app was packed with; nil for an app packed before they were.
@@ -80,6 +91,73 @@ struct LaunchSetting: Decodable, Identifiable {
         let url = URL(fileURLWithPath: app).appendingPathComponent("Contents/Resources/dm/launcher.json")
         guard let data = try? Data(contentsOf: url) else { return nil }
         return (try? JSONDecoder().decode(File.self, from: data))?.settings
+    }
+
+    /// The app's settings as the Mac shows them: the Mac-only Display mode added when the list has none (the host reads
+    /// DM_FULLSCREEN in front_mac.m; a list from settings.tsv will carry it as a platform:mac row), and the render scale's
+    /// base size from the game's profile in the repository when the list does not carry it (render_base).
+    static func forMac(app: String, titleID: String, repo: String, labels: (String) -> String) -> [LaunchSetting]? {
+        guard var list = read(app: app) else { return nil }
+        if !list.contains(where: { $0.env == "DM_FULLSCREEN" }) {
+            let display = LaunchSetting(env: "DM_FULLSCREEN", kind: "choice", label: labels("launch.display"), note: "", def: "",
+                                        section: "Game", options: [["", labels("launch.display.window")], ["1", labels("launch.display.fullscreen")]],
+                                        min: nil, max: nil, step: nil, on: nil, off: nil, unsetValue: "")
+            list.insert(display, at: (list.firstIndex { $0.env == "DM_RENDER_SCALE" }).map { $0 + 1 } ?? 0)
+        }
+        if let i = list.firstIndex(where: { $0.env == "DM_RENDER_SCALE" && $0.base == nil }), let base = renderBase(titleID: titleID, repo: repo) {
+            list[i].base = base
+        }
+        return list
+    }
+
+    /// render_base in the game's profile ("1600x900 1280x720": docked, then handheld).
+    static func renderBase(titleID: String, repo: String) -> [String: [Int]]? {
+        let path = repo + "/dm/games/" + titleID + "/game.tsv"
+        guard !repo.isEmpty, let text = try? String(contentsOfFile: path, encoding: .utf8),
+              let line = text.split(separator: "\n").first(where: { $0.hasPrefix("render_base\t") }) else { return nil }
+        let sizes = line.dropFirst("render_base\t".count).split(separator: " ").map { $0.split(separator: "x").compactMap { Int($0) } }
+        guard sizes.count == 2, sizes.allSatisfy({ $0.count == 2 }) else { return nil }
+        return ["docked": sizes[0], "handheld": sizes[1]]
+    }
+
+    /// The render scale as pixels: the base size of the console mode chosen (DM_OPMODE: 1 docked, 0 handheld) times the scale.
+    func pixels(scale: Double, docked: Bool) -> String? {
+        guard let size = base?[docked ? "docked" : "handheld"], size.count == 2 else { return nil }
+        return "\(Int((Double(size[0]) * scale).rounded()))×\(Int((Double(size[1]) * scale).rounded()))"
+    }
+}
+
+/// A folder in the game's mods folder: RomFS files that replace the game's own (DM_ROMFS_OVERLAY, hle_fs.c). The files are
+/// found in <mod>/romfs, in an Atmosphère layout (<mod>/atmosphere/contents/<title ID>/romfs, <mod>/contents/<title ID>/romfs)
+/// or in the folder itself. A mod with only exefs/ changes the game's code, which the rewriter does not take: listed, not usable.
+struct GameMod: Identifiable, Equatable {
+    let name: String
+    let romfs: String?
+    var id: String { name }
+    var usable: Bool { romfs != nil }
+
+    static func folder(for game: LibraryGame, library: String) -> URL {
+        let root = library.isEmpty
+            ? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NS Port Builder")
+            : URL(fileURLWithPath: library)
+        return root.appendingPathComponent("mods").appendingPathComponent(game.titleID)
+    }
+
+    static func list(in folder: URL, titleID: String) -> [GameMod] {
+        let fm = FileManager.default
+        let names = ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? []).filter { !$0.hasPrefix(".") }.sorted {
+            $0.localizedStandardCompare($1) == .orderedAscending
+        }
+        return names.compactMap { name in
+            var dir: ObjCBool = false
+            let mod = folder.appendingPathComponent(name)
+            guard fm.fileExists(atPath: mod.path, isDirectory: &dir), dir.boolValue else { return nil }
+            let candidates = ["romfs", "atmosphere/contents/\(titleID)/romfs", "contents/\(titleID)/romfs"].map { mod.appendingPathComponent($0).path }
+            if let found = candidates.first(where: { fm.fileExists(atPath: $0) }) { return GameMod(name: name, romfs: found) }
+            let top = ((try? fm.contentsOfDirectory(atPath: mod.path)) ?? []).filter { !$0.hasPrefix(".") }
+            let codeOnly = top.allSatisfy { ["exefs", "atmosphere", "contents"].contains($0.lowercased()) } && !top.isEmpty
+            return GameMod(name: name, romfs: codeOnly || top.isEmpty ? nil : mod.path)
+        }
     }
 }
 
@@ -89,9 +167,20 @@ extension LibraryGame {
         launchOptions[s.env].flatMap { s.accepts($0) ? $0 : nil } ?? s.def
     }
 
-    /// Every setting goes into the app's environment, as the iPhone launcher sets them before the game starts.
+    /// Every setting goes into the app's environment, as the iPhone launcher sets them before the game starts; one at
+    /// its unset value (Display mode: Window) stays out.
     func launchEnvironment(_ settings: [LaunchSetting]) -> [String: String] {
-        Dictionary(uniqueKeysWithValues: settings.map { ($0.env, launchValue($0)) })
+        Dictionary(uniqueKeysWithValues: settings.compactMap { s in
+            let v = launchValue(s)
+            return s.unsetValue == v ? nil : (s.env, v)
+        })
+    }
+
+    /// DM_ROMFS_OVERLAY for the mods switched on that can be used, in the list's order: where two replace one file, the
+    /// one higher in the list wins (the host looks in the folders in order).
+    func modEnvironment(_ available: [GameMod]) -> [String: String] {
+        let paths = available.filter { mods.contains($0.name) }.compactMap(\.romfs)
+        return paths.isEmpty ? [:] : ["DM_ROMFS_OVERLAY": paths.joined(separator: ":")]
     }
 }
 
@@ -299,6 +388,14 @@ final class GameLibrary: ObservableObject {
     func setLaunchOption(_ setting: LaunchSetting, _ value: String, for id: UUID) {
         guard var game = games.first(where: { $0.id == id }) else { return }
         game.launchOptions[setting.env] = setting.isDefault(value) ? nil : value
+        upsert(game)
+    }
+
+    /// A mod switched on or off for one game.
+    func setMod(_ name: String, on: Bool, for id: UUID) {
+        guard var game = games.first(where: { $0.id == id }) else { return }
+        game.mods.removeAll { $0 == name }
+        if on { game.mods.append(name) }
         upsert(game)
     }
 

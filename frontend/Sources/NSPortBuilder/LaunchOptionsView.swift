@@ -1,15 +1,27 @@
+import AppKit
 import SwiftUI
 
 /// A game's launch options: the settings its Mac app was packed with (dm/launcher.json), drawn as the
-/// iPhone launcher draws them, one screen grouped by section. Play passes them to the app as its environment.
+/// iPhone launcher draws them, grouped by section. The basic settings come first, then the game's mods, and the rest
+/// under Advanced settings. Play passes them to the app as its environment.
 struct LaunchOptionsView: View {
     @ObservedObject var m: BuildModel
     @ObservedObject var library: GameLibrary
     let gameID: UUID
     @Environment(\.dismiss) private var dismiss
+    @State private var advancedOpen = false
+    @State private var modsRevision = 0   // bumped by Refresh: the folder is read again
 
     private var game: LibraryGame? { library.games.first { $0.id == gameID } }
-    private var settings: [LaunchSetting]? { game.flatMap { LaunchSetting.read(app: $0.appPath) } }
+    private var settings: [LaunchSetting]? {
+        game.flatMap { LaunchSetting.forMac(app: $0.appPath, titleID: $0.titleID, repo: m.repoPath, labels: m.t) }
+    }
+    private var modsFolder: URL? { game.map { GameMod.folder(for: $0, library: library.folder) } }
+    private var mods: [GameMod] {
+        _ = modsRevision
+        guard let game, let modsFolder else { return [] }
+        return GameMod.list(in: modsFolder, titleID: game.titleID)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -24,20 +36,24 @@ struct LaunchOptionsView: View {
             if let settings, !settings.isEmpty, let game {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 24) {
-                        ForEach(sections(settings), id: \.self) { section in
-                            let rows = settings.filter { $0.sectionTitle == section }
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text(m.t("launch.section." + section)).font(.manrope(15, .semibold)).foregroundStyle(.secondary)
-                                    .padding(.leading, 2)
-                                VStack(spacing: 0) {
-                                    ForEach(rows) { s in
-                                        row(s, game)
-                                        if s.id != rows.last?.id { Divider().opacity(0.25).padding(.leading, 18) }
+                        groups(settings.filter(\.isBasic), game, all: settings)
+                        modsSection(game)
+                        let advanced = settings.filter { !$0.isBasic }
+                        if !advanced.isEmpty {
+                            card {
+                                Button { withAnimation(.easeInOut(duration: 0.18)) { advancedOpen.toggle() } } label: {
+                                    HStack(spacing: 8) {
+                                        Text(m.t("launch.advanced")).font(.manrope(14, .medium))
+                                        Image(systemName: "chevron.right").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary)
+                                            .rotationEffect(.degrees(advancedOpen ? 90 : 0))
+                                        Spacer()
+                                        Text(String(format: m.t("launch.advancedCount"), advanced.count)).font(.manrope(12)).foregroundStyle(.secondary)
                                     }
+                                    .padding(.horizontal, 18).frame(minHeight: 52).contentShape(Rectangle())
                                 }
-                                .background(LauncherPalette.surface.opacity(0.75), in: RoundedRectangle(cornerRadius: 14))
-                                .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.white.opacity(0.06)))
+                                .buttonStyle(.plain)
                             }
+                            if advancedOpen { groups(advanced, game, all: settings) }
                         }
                     }
                     .padding(.horizontal, 30).padding(.bottom, 24)
@@ -71,30 +87,70 @@ struct LaunchOptionsView: View {
         .tint(LauncherPalette.cream)
     }
 
+    // ---- groups of settings ----
+
+    @ViewBuilder private func groups(_ rows: [LaunchSetting], _ game: LibraryGame, all: [LaunchSetting]) -> some View {
+        ForEach(sections(rows), id: \.self) { section in
+            let inSection = rows.filter { $0.sectionTitle == section }
+            VStack(alignment: .leading, spacing: 10) {
+                heading(m.t("launch.section." + section))
+                card {
+                    ForEach(inSection) { s in
+                        row(s, game, all: all)
+                        if s.id != inSection.last?.id { divider }
+                    }
+                }
+            }
+        }
+    }
+
+    private func heading(_ text: String) -> some View {
+        Text(text).font(.manrope(15, .semibold)).foregroundStyle(.secondary).padding(.leading, 2)
+    }
+
+    private func card<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        VStack(spacing: 0, content: content)
+            .background(LauncherPalette.surface.opacity(0.75), in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.white.opacity(0.06)))
+    }
+
+    private var divider: some View { Divider().opacity(0.25).padding(.leading, 18) }
+
     private func sections(_ settings: [LaunchSetting]) -> [String] {
         settings.reduce(into: []) { if !$0.contains($1.sectionTitle) { $0.append($1.sectionTitle) } }
     }
 
     private func set(_ s: LaunchSetting, _ value: String) { library.setLaunchOption(s, value, for: gameID) }
 
-    @ViewBuilder private func row(_ s: LaunchSetting, _ game: LibraryGame) -> some View {
+    /// Docked unless the console mode chosen is handheld (DM_OPMODE 0), for the render scale's pixels.
+    private func docked(_ game: LibraryGame, _ all: [LaunchSetting]) -> Bool {
+        all.first { $0.env == "DM_OPMODE" }.map { game.launchValue($0) != "0" } ?? true
+    }
+
+    @ViewBuilder private func row(_ s: LaunchSetting, _ game: LibraryGame, all: [LaunchSetting]) -> some View {
         let value = game.launchValue(s)
+        let isDocked = docked(game, all)
+        let pixels = s.kind == "range" ? s.pixels(scale: Double(value) ?? 1, docked: isDocked) : nil
         HStack(alignment: .center, spacing: 16) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(s.label).font(.manrope(14, .medium))
-                if !s.note.isEmpty {
+                if let full = s.kind == "range" ? s.pixels(scale: 1, docked: isDocked) : nil {
+                    // The render scale in pixels: the share of the game's own size in the console mode chosen
+                    Text(String(format: m.t(isDocked ? "launch.scaleOfDocked" : "launch.scaleOfHandheld"), Int(((Double(value) ?? 1) * 100).rounded()), full))
+                        .font(.manrope(12)).foregroundStyle(.secondary)
+                } else if !s.note.isEmpty {
                     Text(s.note).font(.manrope(12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer(minLength: 12)
-            control(s, value).frame(width: LaunchControl.width, alignment: .trailing)
+            control(s, value, pixels: pixels).frame(width: LaunchControl.width, alignment: .trailing)
         }
         .padding(.horizontal, 18).padding(.vertical, 13)
         .frame(minHeight: 52)
     }
 
     /// The setting's control, filling the column every row shares (a toggle keeps its size at the column's right edge).
-    @ViewBuilder private func control(_ s: LaunchSetting, _ value: String) -> some View {
+    @ViewBuilder private func control(_ s: LaunchSetting, _ value: String, pixels: String?) -> some View {
         HStack(spacing: 10) {
             switch s.kind {
             case "choice":
@@ -109,14 +165,82 @@ struct LaunchOptionsView: View {
                 LauncherSlider(value: Double(value) ?? Double(s.def) ?? lo, range: lo...hi, step: s.step ?? 0.05) {
                     set(s, String(format: "%.2f", $0))
                 }
-                Text("\(Int(((Double(value) ?? 0) * 100).rounded()))%")
+                Text(pixels ?? "\(Int(((Double(value) ?? 0) * 100).rounded()))%")
                     .font(.manrope(13, .semibold)).monospacedDigit().foregroundStyle(.secondary)
-                    .frame(width: 44, alignment: .trailing)
+                    .frame(width: pixels == nil ? 44 : 72, alignment: .trailing)
             default:
                 Spacer(minLength: 0)
                 Toggle("", isOn: Binding(get: { value == s.onValue }, set: { set(s, $0 ? s.onValue : s.offValue) }))
                     .labelsHidden().toggleStyle(LauncherSwitchStyle())
             }
         }
+    }
+
+    // ---- mods ----
+
+    /// The game's mods folder as switches. A mod changes the files the game reads, saves included: the note says so, and
+    /// Show saves opens the folder to back them up before switching one.
+    @ViewBuilder private func modsSection(_ game: LibraryGame) -> some View {
+        let list = mods
+        VStack(alignment: .leading, spacing: 10) {
+            heading(m.t("launch.mods"))
+            card {
+                if list.isEmpty {
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(m.t("launch.modsNone")).font(.manrope(14, .medium))
+                            Text(m.t("launch.modsHow")).font(.manrope(12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 18).padding(.vertical, 13)
+                } else {
+                    ForEach(list) { mod in
+                        HStack(spacing: 16) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(mod.name).font(.manrope(14, .medium)).lineLimit(1)
+                                if !mod.usable {
+                                    Text(m.t("launch.modCode")).font(.manrope(12)).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer(minLength: 12)
+                            Toggle("", isOn: Binding(get: { mod.usable && game.mods.contains(mod.name) },
+                                                     set: { library.setMod(mod.name, on: $0, for: gameID) }))
+                                .labelsHidden().toggleStyle(LauncherSwitchStyle()).disabled(!mod.usable)
+                        }
+                        .padding(.horizontal, 18).padding(.vertical, 13).frame(minHeight: 52)
+                        divider
+                    }
+                }
+                if list.isEmpty { divider }
+                HStack(spacing: 10) {
+                    Spacer()
+                    Button(m.t("launch.modsRefresh")) { modsRevision += 1 }
+                    Button(m.t("launch.modsOpen")) { openModsFolder() }
+                    Button(m.t("launch.savesShow")) { showSaves(game) }
+                }
+                .buttonStyle(LauncherSecondaryButtonStyle())
+                .padding(.horizontal, 18).padding(.vertical, 12)
+            }
+            Text(m.t(list.count > 1 ? "launch.modsNoteOrder" : "launch.modsNote")).font(.manrope(12)).foregroundStyle(.secondary)
+                .padding(.leading, 2).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func openModsFolder() {
+        guard let folder = modsFolder else { return }
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(folder)
+        modsRevision += 1
+    }
+
+    /// The app's saves (dm/mac/launcher.c: ~/Library/Application Support/nxnative/<title ID>/), to back them up.
+    private func showSaves(_ game: LibraryGame) {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("nxnative").appendingPathComponent(game.titleID)
+        let save = support.appendingPathComponent("save")
+        let target = FileManager.default.fileExists(atPath: save.path) ? save : support
+        if FileManager.default.fileExists(atPath: target.path) { NSWorkspace.shared.activateFileViewerSelecting([target]) }
+        else { NSWorkspace.shared.open(support.deletingLastPathComponent()) }
     }
 }

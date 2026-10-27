@@ -36,6 +36,8 @@ struct ContentView: View {
     @State private var optionsFor: UUID?
     @State private var controlsOpen = false
     @StateObject private var controls = ControlLayout()
+    @StateObject private var gamepad = LauncherGamepad()
+    @State private var padScroll: UUID?   // the card a controller moved to, scrolled into view
     @StateObject private var row = RowScroller()
     private var performStartupChecks: Bool
     @Environment(\.scenePhase) private var scenePhase
@@ -76,6 +78,7 @@ struct ContentView: View {
         .font(.manrope(13))   // the default for text without a font of its own
         .frame(minWidth: 900, idealWidth: 1280, minHeight: 680, idealHeight: 900)
         .onAppear {
+            gamepad.perform = padAction
             refreshArtwork()
             if performStartupChecks { library.discover(); fetchArtwork() }
             if performStartupChecks {
@@ -326,6 +329,7 @@ struct ContentView: View {
             if filteredGames.isEmpty {
                 Text(m.t("library.noResults")).foregroundStyle(.secondary).padding(.vertical, 28)
             } else {
+                ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                         HStack(alignment: .top, spacing: 14) {
                             ForEach(filteredGames) { game in
@@ -352,11 +356,18 @@ struct ContentView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .accessibilityAddTraits(game.id == library.selectedID ? .isSelected : [])
+                                .id(game.id)
                             }
                         }
                         .padding(.bottom, 5)
                         .background(EnclosingScrollView(row: row))
                     }
+                    .onChange(of: padScroll) { id in
+                        guard let id else { return }
+                        withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .center) }
+                        padScroll = nil
+                    }
+                }
                     .overlay(alignment: .topLeading) {
                         if row.canBack {
                             pager("chevron.left", height: cardWidth / 1.8) { row.page(-1, step: step) }.offset(x: -22)
@@ -429,9 +440,24 @@ struct ContentView: View {
                     Image(systemName: "desktopcomputer").foregroundStyle(.secondary)
                     Text(m.t("library.localNote")).font(.manrope(13)).foregroundStyle(.secondary)
                     Spacer()
+                    if gamepad.connected {
+                        // The buttons a controller has here, named as the game names them (A on the right)
+                        HStack(spacing: 18) {
+                            padHint("A", m.t("pad.play")); padHint("X", m.t("pad.options")); padHint("B", m.t("pad.back"))
+                            Image(systemName: "gamecontroller").foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
             .padding(.horizontal, 30).frame(height: 84)
+        }
+    }
+
+    private func padHint(_ button: String, _ label: String) -> some View {
+        HStack(spacing: 7) {
+            Text(button).font(.manrope(11, .bold)).foregroundStyle(.black)
+                .frame(width: 20, height: 20).background(LauncherPalette.cream.opacity(0.9), in: Circle())
+            Text(label).font(.manrope(13)).foregroundStyle(.secondary)
         }
     }
 
@@ -462,6 +488,32 @@ struct ContentView: View {
         page = .builds
     }
 
+    /// A controller's button in the library (LauncherGamepad): left / right move through the collection, A plays, X opens
+    /// the launch options, B closes a sheet or goes back to the library.
+    private func padAction(_ action: LauncherGamepad.Action) {
+        let sheetOpen = optionsFor != nil || controlsOpen || removing != nil
+        switch action {
+        case .b:
+            if optionsFor != nil { optionsFor = nil } else if controlsOpen { controlsOpen = false }
+            else if searching { searching = false; search = "" } else if page != .library { page = .library }
+        case _ where sheetOpen || page != .library:
+            return
+        case .left, .right:
+            let games = filteredGames
+            guard !games.isEmpty else { return }
+            let at = games.firstIndex { $0.id == library.selectedID } ?? 0
+            let next = games[min(max(at + (action == .left ? -1 : 1), 0), games.count - 1)]
+            library.selectedID = next.id
+            padScroll = next.id
+        case .a:
+            if let game = library.selected, !launching { primaryAction(game) }
+        case .x:
+            if let game = library.selected, game.isReady { optionsFor = game.id }
+        case .y:
+            return
+        }
+    }
+
     private func primaryAction(_ game: LibraryGame) {
         if !game.isReady && game.hasIOSBuild {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: game.ipaPath)])
@@ -475,7 +527,10 @@ struct ContentView: View {
             // The launch options; the app's launcher (dm/mac/launcher.c) keeps a variable that is already set.
             // The keyboard and controller layout (Settings → Controls) goes to every game; a build whose host does not read it plays with the default keys.
             var environment = controls.environment
-            if let settings = LaunchSetting.read(app: game.appPath) { environment.merge(game.launchEnvironment(settings)) { _, own in own } }
+            if let settings = LaunchSetting.forMac(app: game.appPath, titleID: game.titleID, repo: m.repoPath, labels: m.t) {
+                environment.merge(game.launchEnvironment(settings)) { _, own in own }
+            }
+            environment.merge(game.modEnvironment(GameMod.list(in: GameMod.folder(for: game, library: library.folder), titleID: game.titleID))) { _, mods in mods }
             if !environment.isEmpty { configuration.environment = environment }
             NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: game.appPath), configuration: configuration) { _, error in
                 DispatchQueue.main.async {
