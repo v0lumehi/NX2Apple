@@ -371,9 +371,12 @@ struct ContentView: View {
                                 .padTarget("card." + game.id.uuidString, scope: "main", radius: 7) { if !launching { primaryAction(game) } }
                             }
                         }
-                        .padding(.bottom, 5)
+                        // Room for the controller's focus ring, which sits 4 pt outside a card: the row clips at its edges, so it
+                        // gets the room inside and gives it back outside (the cards stay where they were)
+                        .padding(.horizontal, Self.ringRoom).padding(.top, Self.ringRoom).padding(.bottom, 5 + Self.ringRoom)
                         .background(EnclosingScrollView(row: row))
                     }
+                    .padding(.horizontal, -Self.ringRoom).padding(.vertical, -Self.ringRoom)
                     .onChange(of: padFocus.focused) { id in   // the focused card scrolls into the row's view
                         guard let id, id.hasPrefix("card.") else { return }
                         withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .center) }
@@ -530,6 +533,9 @@ struct ContentView: View {
             return
         }
     }
+
+    /// The space the collection row keeps around its cards for the focus ring (PadFocus draws it 4 pt outside a target).
+    static let ringRoom: CGFloat = 6
 
     private func primaryAction(_ game: LibraryGame) {
         if !game.isReady && game.hasIOSBuild {
