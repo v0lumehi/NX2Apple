@@ -53,14 +53,10 @@ class DataBlockLowerBound(unittest.TestCase):
                          'data_blocks must default lo to 0 so the NSO path is unchanged')
 
 
-class PatchNsoPassesTheOffset(unittest.TestCase):
-    def test_text_lo_comes_from_the_segment(self):
-        src = (TOOLS / 'patch_nso.py').read_text(encoding='utf-8')
-        # TEXT_LO must be the text segment's memory offset, and both the scan and CODE_RANGES must
-        # use it. Hardcoding 0x80 would break NSOs; dropping it would bring the NRO bug back.
-        self.assertIn('TEXT_LO = segs[0][1]', src)
-        self.assertIn('data_blocks(IMG, TEXT_LO + TEXT_END, md, lo=TEXT_LO)', src)
-        self.assertRegex(src, r'CODE_RANGES = list\(zip\(\[TEXT_LO\]')
+# PatchNsoPassesTheOffset asserted that patch_nso.py passes TEXT_LO = segs[0][1] to data_blocks. The sync fe56176 took upstream's
+# patch_nso.py (not a carrier), so that call is gone and the scan starts at 0 again. It is not put back here: an NRO's text segment
+# starts at memory offset 0 with the 0x80-byte header inside it, so segs[0][1] is 0 and that bound never skipped the header. The
+# fix (a bound of 0x80 for an NRO) belongs in upstream's patch_nso.py; until then issue #14 is open again.
 
 
 if __name__ == '__main__':

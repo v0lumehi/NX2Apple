@@ -50,11 +50,14 @@ OURS = {'dm/host/romfs_arc.c', 'dm/host/romfs_arc.h', 'dm/tools/romfs_arc.py',
         # first wholesale sync deleted it.
         'dm/ios/ENTITLEMENTS.md',
         # This script: fork-only, so a PR that changes it is not a vendored edit (pr-scope reads OURS)
-        'scripts/sync_upstream.py'}
+        'scripts/sync_upstream.py',
+        # The NRO bound's tests (issue #14): fork-only, beside nso_code.py's lo bound
+        'dm/tools/tests/test_nro_header.py'}
 # Vendored files that carry fork patches: taken fresh from upstream, then patched below.
 PATCHED = ('dm/host/hle_fs.c', 'dm/host/Makefile', 'dm/host/tests/Makefile', 'dm/ios/tools/build_ipa.sh',
            'scripts/build_ipa_from_nsp.py', 'dm/gfx/tools/shader_split.py',
-           'dm/ios/Sources/main.m', 'dm/gfx/nvn/nvn_mtl.m', 'dm/host/dm.h')
+           'dm/ios/Sources/main.m', 'dm/gfx/nvn/nvn_mtl.m', 'dm/host/dm.h',
+           'dm/ios/tests/test_romfs_startup.py', 'dm/ios/tests/test_profile_pack.py', 'docs/env_switches.tsv')
 
 def git(*a):
     r = subprocess.run(['git', *a], cwd=REPO, capture_output=True, text=True)
@@ -906,6 +909,48 @@ def patch_dm_h(t):
         ' dm_profile() is the accessor', 1))
 
 
+ROMFS_TEST_STUB = ('typedef struct { const char *id, *romfs_marker; } fixture_profile;   /* the fork reads both from the runtime profile */\n'
+                   'static const fixture_profile *dm_profile(void) { static const fixture_profile p = {"0100000000000000", "marker"}; return &p; }\n')
+
+def patch_test_romfs_startup(t):
+    """The test compiles main.m's RomFS locator alone, with a stub for each name it needs. The fork's
+    locator reads the game's id and romfs_marker through dm_profile() (the runtime profile, patch_main_m),
+    which upstream's stubs do not provide: clang stopped on "call to undeclared function dm_profile".
+    The fixture gets a dm_profile() with the marker the test already uses."""
+    if 'fixture_profile' in t: return skip('test_romfs_startup dm_profile stub (already patched)')
+    old = "#define DM_GAME_ROMFS_MARKER \"marker\"\\n'"
+    if old not in t: fail('dm/ios/tests/test_romfs_startup.py: the fixture preamble anchor is missing'); return t
+    return done('test_romfs_startup dm_profile stub', t.replace(old, old + "\n                          " + repr(ROMFS_TEST_STUB), 1))
+
+def patch_test_profile_pack(t):
+    """Upstream packs the RomFS into the IPA; the fork's default is the slim package (patch_build_ipa:
+    DM_FULL_ROMFS=1 packs it), so the test checks that the RomFS stays out instead."""
+    if 'slim package' in t: return skip('test_profile_pack slim IPA (already patched)')
+    old = "                    self.assertEqual(archive.read('Payload/DmIOS.app/romfs/marker'), b'romfs')"
+    if old not in t: fail('dm/ios/tests/test_profile_pack.py: the RomFS assertion anchor is missing'); return t
+    new = ("                    # the fork's slim package: the RomFS stays out of the IPA (DM_FULL_ROMFS=1 packs it)\n"
+           "                    self.assertFalse(any(n.startswith('Payload/DmIOS.app/romfs') for n in names))")
+    return done('test_profile_pack slim IPA', t.replace(old, new, 1))
+
+
+# The switches only the fork's code reads, with their rows in docs/env_switches.tsv (name, class, meaning)
+FORK_SWITCHES = {
+    'DM_FULL_ROMFS': ('switch', '`=1` makes `build_ipa.sh` pack the RomFS (and DLC) into the IPA, as upstream does; the fork\'s default is the slim package, whose game data the app reads from `Documents/games/<title ID>/`'),
+    'DM_PROFILE': ('path', '`=<file>`: the runtime game profile (`game.py profile`) the host reads at start (`hle_profile.c`); without it the compiled `game_profile.h` values apply'),
+}
+
+def patch_env_switches(t):
+    """docs/env_switches.tsv is upstream's table of every switch the code reads, and test_env_switches.py
+    fails when a switch the code reads has no row. The fork's own switches (FORK_SWITCHES) lose their rows
+    whenever upstream rewrites the table; they go back in name order."""
+    rows = t.rstrip('\n').split('\n')
+    have = {r.split('\t', 1)[0] for r in rows}
+    missing = [n for n in FORK_SWITCHES if n not in have]
+    if not missing: return skip('env_switches.tsv fork rows (already patched)')
+    head, body = rows[0], rows[1:] + [f'{n}\t{c}\t{m}' for n, (c, m) in FORK_SWITCHES.items() if n in missing]
+    return done('env_switches.tsv fork rows: ' + ' '.join(missing), '\n'.join([head] + sorted(body, key=lambda r: r.split('\t', 1)[0])) + '\n')
+
+
 def patch_hades2(t):
     """The fork's Hades II profile carries what we verified end to end — the update (v1,
     1.0.137848) registered and packed, the measured NVN texture slots (35: slot 34 lies past the
@@ -929,6 +974,9 @@ MARKERS = {
     'dm/gfx/nvn/nvn_mtl.m': 'if (on_sub_thread()) rec_publish();',
     'dm/games/0100A00019DE0000/game.tsv': 'build	v1	1.0.137848',
     'dm/host/dm.h': 'hle_profile.h',
+    'dm/ios/tests/test_romfs_startup.py': 'fixture_profile',
+    'dm/ios/tests/test_profile_pack.py': 'slim package',
+    'docs/env_switches.tsv': 'DM_FULL_ROMFS\t',
 }
 PATCHERS = {
     'dm/host/hle_fs.c': patch_hle_fs,
@@ -941,6 +989,9 @@ PATCHERS = {
     'dm/gfx/nvn/nvn_mtl.m': patch_nvn_mtl,
     'dm/games/0100A00019DE0000/game.tsv': patch_hades2,
     'dm/host/dm.h': patch_dm_h,
+    'dm/ios/tests/test_romfs_startup.py': patch_test_romfs_startup,
+    'dm/ios/tests/test_profile_pack.py': patch_test_profile_pack,
+    'docs/env_switches.tsv': patch_env_switches,
 }
 
 report, problems = [], []
